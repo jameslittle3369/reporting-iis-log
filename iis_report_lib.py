@@ -125,6 +125,31 @@ def parse_iis_log(path):
             .str[0]  # drop a trailing :port if present
         )
 
+    # IIS custom error pages: when a request 404s (or otherwise errors)
+    # behind a configured custom error page, IIS executes that page and logs
+    # it as a 200 hit on e.g. /error.htm, stowing the original status + URL
+    # in cs-uri-query as "STATUS;http://host:port/original/path". Rewrite
+    # those rows to the original status/resource so error counts reflect
+    # what actually failed, keeping the logged values in _logged_*.
+    if "cs-uri-query" in df.columns and "cs-uri-stem" in df.columns and "sc-status" in df.columns:
+        extracted = df["cs-uri-query"].astype("string").str.extract(
+            r"^(?P<orig_status>\d{3});(?P<orig_url>https?://\S+)$"
+        )
+        is_redirect = extracted["orig_status"].notna()
+        df["_error_redirect"] = is_redirect
+        df["_logged_status"] = df["sc-status"]
+        df["_logged_uri"] = df["cs-uri-stem"]
+        if is_redirect.any():
+            df.loc[is_redirect, "sc-status"] = pd.to_numeric(extracted.loc[is_redirect, "orig_status"])
+            df.loc[is_redirect, "cs-uri-stem"] = extracted.loc[is_redirect, "orig_url"].str.replace(
+                r"^https?://[^/]+", "", regex=True
+            )
+
+    # Referer without its query string (ad click IDs etc. make every value unique).
+    ref_col = next((c for c in df.columns if c.lower() == "cs(referer)"), None)
+    if ref_col:
+        df["_referer_page"] = df[ref_col].astype("string").str.split("?").str[0]
+
     # Status bucket, used throughout analysis/reporting.
     if "sc-status" in df.columns:
         df["_status_bucket"] = df["sc-status"].apply(_status_bucket)
@@ -261,30 +286,41 @@ def compute_summary(df, top_n=15):
         summary["top_error_combos"] = None
         summary["top_error_pages_table"] = None
 
-    # IIS custom error page redirects: when a request 404s (or otherwise
-    # errors) behind a configured custom error page, IIS internally
-    # redirects to that page and stows the original status + URL in
-    # cs-uri-query as "STATUS;http://host:port/original/path". The referer
-    # is empty for these (it's a server-side redirect, not a browser nav),
-    # so this query string is the only record of what page actually 404'd.
-    if uri_col and "cs-uri-query" in df.columns:
-        redirect_pattern = df["cs-uri-query"].astype("string").str.match(r"^\d{3};https?://", na=False)
-        redirects = df[redirect_pattern].copy()
-        if len(redirects):
-            extracted = redirects["cs-uri-query"].str.extract(r"^(?P<orig_status>\d{3});(?P<orig_url>https?://\S+)$")
-            redirects["_orig_status"] = extracted["orig_status"]
-            redirects["_orig_path"] = extracted["orig_url"].str.replace(r"^https?://[^/]+", "", regex=True)
-            summary["error_redirect_total"] = len(redirects)
-            summary["error_redirect_target_pages"] = redirects[uri_col].value_counts()
-            summary["error_redirect_sources"] = redirects["_orig_path"].value_counts().head(top_n)
-        else:
-            summary["error_redirect_total"] = 0
-            summary["error_redirect_target_pages"] = None
-            summary["error_redirect_sources"] = None
-    else:
-        summary["error_redirect_total"] = 0
-        summary["error_redirect_target_pages"] = None
-        summary["error_redirect_sources"] = None
+    # IIS custom error page redirects (rewritten to their original status /
+    # resource in parse_iis_log). The referer, when the browser sent one,
+    # is the page that linked to or loaded the missing resource.
+    summary["error_redirect_total"] = 0
+    summary["error_redirect_target_pages"] = None
+    summary["error_redirect_sources"] = None
+    summary["error_redirect_referers"] = None
+    if "_error_redirect" in df.columns and df["_error_redirect"].any():
+        redirects = df[df["_error_redirect"]]
+        summary["error_redirect_total"] = len(redirects)
+        summary["error_redirect_target_pages"] = redirects["_logged_uri"].value_counts()
+
+        has_ref = "_referer_page" in redirects.columns
+        groups = redirects.groupby([uri_col, "sc-status"])
+        sources = groups.size().rename("Redirects").reset_index()
+        if has_ref:
+            top_ref = groups["_referer_page"].agg(
+                lambda s: s.value_counts().index[0] if s.notna().any() else "-"
+            ).rename("Top Referrer").reset_index()
+            sources = sources.merge(top_ref, on=[uri_col, "sc-status"])
+        sources = sources.sort_values("Redirects", ascending=False).head(top_n)
+        summary["error_redirect_sources"] = sources.rename(
+            columns={uri_col: "Original Resource", "sc-status": "Status"}
+        ).reset_index(drop=True)
+
+        if has_ref:
+            with_ref = redirects[redirects["_referer_page"].notna()]
+            if len(with_ref):
+                summary["error_redirect_referers"] = (
+                    with_ref.groupby(["_referer_page", uri_col, "sc-status"]).size()
+                    .rename("Count").reset_index()
+                    .sort_values("Count", ascending=False).head(top_n)
+                    .rename(columns={"_referer_page": "Referring Page", uri_col: "Missing Resource", "sc-status": "Status"})
+                    .reset_index(drop=True)
+                )
 
     # Response time
     if "time-taken" in df.columns and df["time-taken"].notna().any():
@@ -528,16 +564,28 @@ def _error_redirect_section_html(summary):
     if targets is not None and not targets.empty:
         target_list = ", ".join(f"{_esc(p)} ({c:,})" for p, c in targets.items())
         target_note = f'<p style="color:#64748b;font-size:12.5px;margin-top:-4px;">Redirect target page(s): {target_list}</p>'
+    referers = summary.get("error_redirect_referers")
+    referer_html = ""
+    if referers is not None and not referers.empty:
+        referer_html = f"""
+    <h3>Broken References From Referring Pages</h3>
+    <p style="color:#64748b;font-size:12.5px;">
+      Pages (per the browser's Referer header) that link to or load a resource that failed.
+      Referrers on your own site point to broken links or missing assets to fix.
+    </p>
+    {_df_table_html(referers)}"""
     return f"""
   <div class="section">
     <h2>Pages That Redirected to a Custom Error Page ({total:,} redirects)</h2>
     <p style="color:#64748b;font-size:12.5px;">
-      IIS redirects failed requests to a configured custom error page and records the
-      original URL and status in the query string. This table shows what actually
-      404'd (or errored), not just hits on the error page itself.
+      IIS serves a configured custom error page for failed requests and logs it as a 200,
+      recording the original URL and status in the query string. This table shows what
+      actually 404'd (or errored). These requests are counted under their original status
+      in the KPIs, status breakdown and error tables above.
     </p>
     {target_note}
-    {_series_table_html(sources, ("Original Page", "Redirects"))}
+    {_df_table_html(sources)}
+    {referer_html}
   </div>
 """
 

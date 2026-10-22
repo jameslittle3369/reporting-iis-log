@@ -26,7 +26,7 @@ import sys
 
 import pandas as pd
 
-from iis_report_lib import parse_iis_log, resolve_input_paths
+from iis_report_lib import compute_summary, parse_iis_log, resolve_input_paths
 
 pd.set_option("display.width", 120)
 pd.set_option("display.max_colwidth", 60)
@@ -98,6 +98,20 @@ def analyze(df, top_n=15):
             print(combo.to_string())
         else:
             print("No 4xx/5xx errors found.")
+
+    # ---- Custom error page redirects ------------------------------------------
+    if "_error_redirect" in df.columns and df["_error_redirect"].any():
+        summary = compute_summary(df, top_n)
+        print_header(f"CUSTOM ERROR PAGE REDIRECTS ({summary['error_redirect_total']:,})")
+        print("Logged as hits on: " + ", ".join(
+            f"{p} ({c:,})" for p, c in summary["error_redirect_target_pages"].items()
+        ))
+        print("(counted under their original status in the sections above)")
+        print(f"\nTOP {top_n} ORIGINAL RESOURCES")
+        print(summary["error_redirect_sources"].to_string(index=False))
+        if summary["error_redirect_referers"] is not None:
+            print(f"\nTOP {top_n} REFERRING PAGES -> MISSING RESOURCES")
+            print(summary["error_redirect_referers"].to_string(index=False))
 
     # ---- Slowest requests -------------------------------------------------
     if "time-taken" in df.columns and df["time-taken"].notna().any():

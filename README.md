@@ -231,13 +231,23 @@ console output.
 
 ### Custom error page redirects
 
-When IIS redirects a failed request to a configured custom error page
-(e.g. `/error.htm`), it stows the original status and URL in
-`cs-uri-query` as `STATUS;http://host:port/original/path` - the referer is
-empty since it's a server-side redirect, not a browser navigation. The
-HTML/email reports parse this automatically and add a "Pages That
-Redirected to a Custom Error Page" table showing what actually 404'd,
-distinct from raw hit counts on the error page itself.
+When IIS serves a configured custom error page (e.g. `/error.htm`) for a
+failed request, it logs a **200** hit on that page and stows the original
+status and URL in `cs-uri-query` as `STATUS;http://host:port/original/path`.
+
+The parser rewrites these rows to the original status and resource (the
+logged values are kept in `_logged_status` / `_logged_uri`), so the error
+rate, status breakdown, charts and error tables count them as the real
+404s/500s they are.
+
+All three reports (console, HTML, email) also include a "Custom Error Page
+Redirects" section with:
+
+- **Original resources** - what actually failed, its original status, and
+  the most common referring page.
+- **Referring pages -> missing resources** - from the browser's Referer
+  header (query string stripped). Referrers on your own site are broken
+  links or missing assets to fix.
 
 ## Troubleshooting
 

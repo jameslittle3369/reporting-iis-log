@@ -35,6 +35,7 @@ def main():
     )
     parser.add_argument("--out", default="iis_report.html", help="Output HTML file path (default: iis_report.html)")
     parser.add_argument("--top", type=int, default=15, help="Number of rows in each ranked table/chart (default: 15)")
+    parser.add_argument("--slow-ms", type=int, default=10000, help="Threshold in ms for the slow-request analysis (default: 10000)")
     parser.add_argument("--title", default="IIS Log Report", help="Report title shown at the top of the page")
     parser.add_argument("--open", action="store_true", help="Open the generated report in the default browser")
     args = parser.parse_args()
@@ -50,7 +51,7 @@ def main():
 
     print(f"Parsed {len(df):,} requests from {len(paths)} file(s): {', '.join(paths)}")
 
-    summary = compute_summary(df, top_n=args.top)
+    summary = compute_summary(df, top_n=args.top, slow_ms=args.slow_ms)
     charts = generate_charts(summary)
     html = build_html_report(
         summary,

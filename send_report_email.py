@@ -132,6 +132,7 @@ def main():
     parser.add_argument("--subject", default=None, help="Email subject (default: auto-generated with the log date range).")
     parser.add_argument("--title", default="IIS Log Report", help="Report title shown at the top of the HTML body.")
     parser.add_argument("--top", type=int, default=15, help="Number of rows in each ranked table/chart (default: 15)")
+    parser.add_argument("--slow-ms", type=int, default=10000, help="Threshold in ms for the slow-request analysis (default: 10000)")
     parser.add_argument("--region", default=None, help="AWS region for SES (default: from AWS config/env, e.g. us-east-1).")
     parser.add_argument(
         "--dry-run",
@@ -161,7 +162,7 @@ def main():
 
     print(f"Parsed {len(df):,} requests from {len(paths)} file(s): {', '.join(paths)}")
 
-    summary = compute_summary(df, top_n=args.top)
+    summary = compute_summary(df, top_n=args.top, slow_ms=args.slow_ms)
     charts = generate_charts(summary)
     html_body = build_html_report(
         summary,

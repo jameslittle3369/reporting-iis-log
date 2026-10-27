@@ -43,7 +43,7 @@ def print_header(title):
     print("=" * 78)
 
 
-def analyze(df, top_n=15):
+def analyze(df, top_n=15, slow_ms=10000):
     total = len(df)
     print_header("IIS LOG ANALYSIS SUMMARY")
     print(f"Total requests parsed : {total:,}")
@@ -118,10 +118,18 @@ def analyze(df, top_n=15):
         print_header("RESPONSE TIME (time-taken, ms)")
         print(df["time-taken"].describe().to_string())
 
+        summary = compute_summary(df, top_n, slow_ms)
+        print_header(f"SLOW REQUESTS (>= {slow_ms / 1000:g} s): {summary['slow_count']:,}")
+        if summary["slow_incidents"] is not None:
+            print("INCIDENT WINDOWS (10 min) - many unrelated pages slow at once = shared backend")
+            print(summary["slow_incidents"].to_string(index=False))
+            print("\nDYNAMIC vs STATIC LATENCY - static fast while dynamic stalls = app backend bottleneck")
+            print(summary["latency_by_type"].to_string(index=False))
+            print("\nSLOW REQUESTS BY PAGE")
+            print(summary["slow_by_page"].to_string(index=False))
+
         print(f"\nTOP {top_n} SLOWEST REQUESTS")
-        slow_cols = [c for c in [uri_col, "sc-status", "time-taken", "timestamp", "c-ip"] if c and c in df.columns]
-        slowest = df.sort_values("time-taken", ascending=False).head(top_n)[slow_cols]
-        print(slowest.to_string(index=False))
+        print(summary["slowest_requests"].to_string(index=False))
 
     # ---- Traffic over time --------------------------------------------------
     if "timestamp" in df.columns and df["timestamp"].notna().any():
@@ -208,6 +216,9 @@ def main():
         "--top", type=int, default=15, help="Number of top rows to show in each ranked section (default: 15)"
     )
     parser.add_argument(
+        "--slow-ms", type=int, default=10000, help="Threshold in ms for the slow-request analysis (default: 10000)"
+    )
+    parser.add_argument(
         "--export-dir",
         default=None,
         help="If set, also writes CSV reports (top pages, errors, status codes, client IPs) to this directory.",
@@ -232,7 +243,7 @@ def main():
         sys.exit(1)
 
     df = pd.concat(frames, ignore_index=True)
-    df = analyze(df, top_n=args.top)
+    df = analyze(df, top_n=args.top, slow_ms=args.slow_ms)
 
     if args.export_dir:
         export_reports(df, args.export_dir, top_n=args.top)

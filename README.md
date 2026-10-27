@@ -249,6 +249,40 @@ Redirects" section with:
   header (query string stripped). Referrers on your own site are broken
   links or missing assets to fix.
 
+### Diagnosing slow requests
+
+All three reports include a "Slow Requests" section for requests at or
+above `--slow-ms` (default 10000):
+
+- **Incident windows** - slow requests grouped into 10-minute windows.
+  Many unrelated pages slow in the same window points to a shared backend
+  (database, external API) rather than one page.
+- **Dynamic vs. static latency** - during incidents vs. other times. Static
+  files staying fast while `.aspx` stalls means IIS and the network were
+  fine and the application's backend was the bottleneck.
+- **Slow requests by page** - slow count, % slow, p90 and max per
+  method + page.
+- **Slowest requests** - now with method, bytes in/out and
+  `sc-win32-status` (64 / 995 = the client or proxy gave up and
+  disconnected).
+
+`time-taken` runs from the first byte received to the last byte sent, so it
+includes delivery to the client/proxy. A small response that took a long
+time means server processing, not a slow download.
+
+The IIS log can't show *why* a request was slow. On the web server, check:
+
+- `C:\Windows\System32\LogFiles\HTTPERR\` - HTTP.sys timeouts and drops
+  (`Timer_ConnectionIdle`, `Timer_EntityBody`, `Timer_MinBytesPerSecond`,
+  `Connection_Dropped`, `Connection_Abandoned_By_ReqQueue`).
+- Event Viewer -> Application: ASP.NET event 1309 ("Request timed out",
+  SQL timeouts). System: WAS 5011/5013/5186 (app pool crashes, ping
+  timeouts, recycles).
+- Failed Request Tracing with a time-taken trigger (e.g. 15 s) on `*.aspx`
+  to see which stage the time went to.
+- SQL Server blocking/deadlocks during the incident windows.
+- The load balancer's own timeout / 504 logs.
+
 ## Troubleshooting
 
 - **`ModuleNotFoundError`** — the venv isn't activated, or setup didn't

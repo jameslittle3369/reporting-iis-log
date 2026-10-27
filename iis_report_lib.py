@@ -44,6 +44,19 @@ STATUS_BUCKET_COLORS = {
     "other": "#9b59b6",
 }
 
+# sc-win32-status values commonly seen on slow/aborted requests.
+WIN32_STATUS = {
+    0: "",
+    64: "client disconnected",
+    121: "timeout (semaphore)",
+    995: "operation aborted",
+    1236: "connection aborted by server",
+    12002: "upstream timeout",
+    12152: "bad upstream response",
+}
+
+DYNAMIC_EXTENSIONS = (".aspx", ".ashx", ".asmx", ".svc", ".axd")
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -211,10 +224,10 @@ def load_logs(path_arg):
 # Summary statistics / KPIs
 # ---------------------------------------------------------------------------
 
-def compute_summary(df, top_n=15):
+def compute_summary(df, top_n=15, slow_ms=10000):
     """Compute all summary stats/tables used by both the console and HTML reports."""
     total = len(df)
-    summary = {"total_requests": total, "top_n": top_n}
+    summary = {"total_requests": total, "top_n": top_n, "slow_ms": slow_ms}
 
     if "timestamp" in df.columns and df["timestamp"].notna().any():
         summary["date_min"] = df["timestamp"].min()
@@ -326,12 +339,13 @@ def compute_summary(df, top_n=15):
     if "time-taken" in df.columns and df["time-taken"].notna().any():
         summary["response_time_stats"] = df["time-taken"].describe()
         summary["avg_response_ms"] = round(df["time-taken"].mean(), 1)
-        slow_cols = [c for c in [uri_col, "sc-status", "time-taken", "timestamp", ip_col] if c and c in df.columns]
-        summary["slowest_requests"] = df.sort_values("time-taken", ascending=False).head(top_n)[slow_cols]
+        summary["slowest_requests"] = _slowest_requests(df, uri_col, ip_col, top_n)
+        summary.update(_slow_request_analysis(df, uri_col, top_n, slow_ms))
     else:
         summary["response_time_stats"] = None
         summary["avg_response_ms"] = None
         summary["slowest_requests"] = None
+        summary.update(_slow_request_analysis(None, uri_col, top_n, slow_ms))
 
     # Bandwidth
     if "sc-bytes" in df.columns and df["sc-bytes"].notna().any():
@@ -367,6 +381,75 @@ def compute_summary(df, top_n=15):
     summary["methods"] = df["cs-method"].value_counts() if "cs-method" in df.columns else None
 
     return summary
+
+
+def _slowest_requests(df, uri_col, ip_col, top_n):
+    cols = [c for c in ["timestamp", "cs-method", uri_col, "sc-status", "sc-win32-status",
+                        "time-taken", "sc-bytes", "cs-bytes", ip_col] if c and c in df.columns]
+    slowest = df.sort_values("time-taken", ascending=False).head(top_n)[cols].copy()
+    if "sc-win32-status" in slowest.columns:
+        slowest["Win32 Meaning"] = slowest["sc-win32-status"].map(
+            lambda v: WIN32_STATUS.get(int(v), "see Win32 error codes") if pd.notna(v) else ""
+        )
+    return slowest
+
+
+def _slow_request_analysis(df, uri_col, top_n, slow_ms):
+    """Group slow requests into 10-minute incident windows and compare dynamic vs
+    static latency inside them. If static files stay fast while dynamic pages
+    stall, IIS/network are fine and the app's backend (DB, external API) is
+    the bottleneck."""
+    out = {"slow_count": 0, "slow_incidents": None, "latency_by_type": None, "slow_by_page": None}
+    if df is None or not uri_col or "timestamp" not in df.columns:
+        return out
+    slow = df[df["time-taken"] >= slow_ms]
+    out["slow_count"] = len(slow)
+    if slow.empty:
+        return out
+
+    window = df["timestamp"].dt.floor("10min")
+    slow_window = window[slow.index]
+    out["slow_incidents"] = (
+        slow.groupby(slow_window)
+        .agg(**{
+            "Slow Requests": ("time-taken", "size"),
+            "Pages Affected": (uri_col, "nunique"),
+            "Max (s)": ("time-taken", lambda s: round(s.max() / 1000, 1)),
+            "Pages": (uri_col, lambda s: ", ".join(s.value_counts().index[:5])),
+        })
+        .rename_axis("Window").reset_index()
+        .assign(Window=lambda d: d["Window"].dt.strftime("%Y-%m-%d %H:%M"))
+    )
+
+    in_incident = window.isin(set(slow_window.dropna()))
+    is_dynamic = df[uri_col].astype("string").str.lower().str.endswith(DYNAMIC_EXTENSIONS, na=False)
+    latency = (
+        df.assign(
+            Period=in_incident.map({True: "During incidents", False: "Other times"}),
+            Type=is_dynamic.map({True: "Dynamic", False: "Static"}),
+        )
+        .groupby(["Period", "Type"])["time-taken"]
+        .agg(Requests="size", **{
+            "Median (ms)": "median",
+            "p90 (ms)": lambda s: s.quantile(0.9),
+            "Max (ms)": "max",
+        })
+        .round(0).astype(int).reset_index()
+    )
+    out["latency_by_type"] = latency
+
+    keys = [c for c in ["cs-method", uri_col] if c in df.columns]
+    slow_pages = slow.groupby(keys).size().rename("Slow")
+    all_pages = df[df.set_index(keys).index.isin(slow_pages.index)].groupby(keys)["time-taken"]
+    by_page = pd.concat([
+        slow_pages,
+        all_pages.size().rename("Total"),
+        all_pages.quantile(0.9).round(0).astype(int).rename("p90 (ms)"),
+        (all_pages.max() / 1000).round(1).rename("Max (s)"),
+    ], axis=1).reset_index()
+    by_page.insert(len(keys) + 2, "% Slow", (by_page["Slow"] / by_page["Total"] * 100).round(1))
+    out["slow_by_page"] = by_page.sort_values("Slow", ascending=False).head(top_n).reset_index(drop=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +673,35 @@ def _error_redirect_section_html(summary):
 """
 
 
+def _slow_section_html(summary):
+    slow_s = summary.get("slow_ms", 10000) / 1000
+    note = 'style="color:#64748b;font-size:12.5px;"'
+    parts = [f"""
+  <div class="section">
+    <h2>Slow Requests (&ge; {slow_s:g} s): {summary.get('slow_count', 0):,}</h2>
+    <p {note}>
+      time-taken runs from the first byte received to the last byte sent, so it includes
+      server processing plus the time to deliver the response to the client or proxy.
+      Small responses that take a long time mean the server was processing, not a slow download.
+    </p>"""]
+    if summary.get("slow_incidents") is not None:
+        parts.append(f"""
+    <h3>Incident Windows (10 min)</h3>
+    <p {note}>Many unrelated pages slow in the same window points to a shared backend (database, external API) rather than one page.</p>
+    {_df_table_html(summary["slow_incidents"])}
+    <h3>Dynamic vs. Static Latency</h3>
+    <p {note}>If static files stay fast while dynamic pages stall during incidents, IIS and the network were fine and the application's backend was the bottleneck.</p>
+    {_df_table_html(summary["latency_by_type"])}
+    <h3>Slow Requests by Page</h3>
+    {_df_table_html(summary["slow_by_page"])}""")
+    parts.append(f"""
+    <h3>Slowest Requests</h3>
+    {_df_table_html(summary.get("slowest_requests"))}
+  </div>
+""")
+    return "".join(parts)
+
+
 def _esc(v):
     return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -652,10 +764,7 @@ def build_html_report(summary, charts, title="IIS Log Report", embed="base64", s
 
   {_error_redirect_section_html(summary)}
 
-  <div class="section">
-    <h2>Slowest Requests</h2>
-    {_df_table_html(summary.get("slowest_requests"))}
-  </div>
+  {_slow_section_html(summary)}
 
   <div class="section">
     <h2>Top {summary['top_n']} Client IPs</h2>
